@@ -7,7 +7,7 @@ const { CognitoIdentityClient, GetIdCommand, GetCredentialsForIdentityCommand } 
 
 const TG_TOKEN = process.env.TG_TOKEN || '8904389443:AAG9uA1qbb2xhz7oskWYrNdmMW1Ozz46-2Y';
 const TG_CHAT  = process.env.TG_CHAT  || '7776240161';
-const PORT     = process.env.PORT     || 8080;
+const PORT     = process.env.PORT     || 3001;
 
 const app = express();
 app.use(express.json());
