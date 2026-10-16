@@ -4,22 +4,26 @@ const cors    = require('cors');
 const axios   = require('axios');
 const aws4    = require('aws4');
 const path    = require('path');
-const { CognitoIdentityClient, GetIdCommand, GetCredentialsForIdentityCommand } = require('@aws-sdk/client-cognito-identity');
+const {
+  CognitoIdentityClient,
+  GetIdCommand,
+  GetCredentialsForIdentityCommand,
+} = require('@aws-sdk/client-cognito-identity');
 
-// ✅ FIX 1: no hardcodear tokens en el código — usar variables de entorno
+// ── Variables de entorno (NO hardcodear tokens) ──────────────────────────────
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT  = process.env.TG_CHAT;
 const PORT     = process.env.PORT || 3001;
 
 if (!TG_TOKEN || !TG_CHAT) {
-  console.warn('⚠️  TG_TOKEN o TG_CHAT no están definidos. Las notificaciones de Telegram están deshabilitadas.');
+  console.warn('⚠️  TG_TOKEN o TG_CHAT no están definidos. Notificaciones deshabilitadas.');
 }
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cors({ origin: true, credentials: true }));
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Config AWS ────────────────────────────────────────────────────────────────
 const AWS_REGION    = 'us-east-1';
 const IDENTITY_POOL = 'us-east-1:353fa4ba-6d7c-477f-8018-8f54953476bb';
 const API_HOST      = 't3a9z73ceg.execute-api.us-east-1.amazonaws.com';
@@ -27,24 +31,24 @@ const API_BASE      = `https://${API_HOST}/prod`;
 const TENANT_ID     = '1111111';
 const cognitoClient = new CognitoIdentityClient({ region: AWS_REGION });
 
-// ── Credenciales Cognito (se renuevan cada ~50min) ────────────────────────────
-let _creds = null;
-let _credsExpiry = 0;
-let _credsPromise = null; // ✅ FIX 2: evitar múltiples GetId simultáneos
+// ── Credenciales Cognito (cache 50 min) ───────────────────────────────────────
+let _creds        = null;
+let _credsExpiry  = 0;
+let _credsPromise = null;
 
 async function getCreds() {
   const now = Date.now();
   if (_creds && now < _credsExpiry) return _creds;
-  if (_credsPromise) return _credsPromise; // si ya hay una renovación en curso, reusarla
+  if (_credsPromise) return _credsPromise;
 
   _credsPromise = (async () => {
     try {
-      // 1) Obtener Identity ID
+      // 1) Identity ID
       const { IdentityId } = await cognitoClient.send(
         new GetIdCommand({ IdentityPoolId: IDENTITY_POOL })
       );
 
-      // 2) Obtener credenciales temporales
+      // 2) Credenciales temporales
       const { Credentials } = await cognitoClient.send(
         new GetCredentialsForIdentityCommand({ IdentityId })
       );
@@ -58,7 +62,7 @@ async function getCreds() {
         secretAccessKey: Credentials.SecretKey,
         sessionToken:    Credentials.SessionToken,
       };
-      // ✅ FIX 3: expiración con 10 min de margen (antes 5)
+      // Margen de 10 min antes de expirar
       _credsExpiry = new Date(Credentials.Expiration).getTime() - 10 * 60 * 1000;
       console.log(`✅ Credenciales Cognito renovadas (expiran: ${Credentials.Expiration})`);
       return _creds;
@@ -70,12 +74,11 @@ async function getCreds() {
   return _credsPromise;
 }
 
-// ── Llamada firmada a la API ──────────────────────────────────────────────────
+// ── Firma SigV4 + llamada a la API ────────────────────────────────────────────
 async function signedPost(pathName, body) {
-  const creds = await getCreds();
+  const creds   = await getCreds();
   const bodyStr = JSON.stringify(body);
 
-  // ✅ FIX 4: armar opts correctamente con aws4
   const request = {
     host:    API_HOST,
     path:    `/prod${pathName}`,
@@ -90,38 +93,40 @@ async function signedPost(pathName, body) {
     body: bodyStr,
   };
 
-  // aws4.sign agrega automáticamente:
+  // aws4 agrega automáticamente:
   //   - Authorization (SigV4)
   //   - X-Amz-Date
-  //   - X-Amz-Security-Token (si sessionToken está presente) ✅
+  //   - X-Amz-Security-Token (porque le pasamos sessionToken)
   const opts = aws4.sign(request, {
     accessKeyId:     creds.accessKeyId,
     secretAccessKey: creds.secretAccessKey,
     sessionToken:    creds.sessionToken,
   });
 
-  // ✅ FIX 5: log para depurar la firma (quitar en producción)
+  // Debug opcional
   if (process.env.DEBUG_AWS === '1') {
     console.log('🔐 Firma SigV4 →', {
-      host: opts.host,
-      path: opts.path,
-      hasAuth: !!opts.headers['Authorization'] || !!opts.headers['authorization'],
-      hasAmzDate: !!opts.headers['X-Amz-Date'] || !!opts.headers['x-amz-date'],
-      hasSecToken: !!opts.headers['X-Amz-Security-Token'] || !!opts.headers['x-amz-security-token'],
+      host:        opts.host,
+      path:        opts.path,
+      hasAuth:     !!(opts.headers['Authorization']      || opts.headers['authorization']),
+      hasAmzDate:  !!(opts.headers['X-Amz-Date']         || opts.headers['x-amz-date']),
+      hasSecToken: !!(opts.headers['X-Amz-Security-Token'] || opts.headers['x-amz-security-token']),
     });
   }
 
-  try {
-    const { data } = await axios.post(`${API_BASE}${pathName}`, body, {
-      headers: opts.headers,
-      timeout: 20_000,
-      validateStatus: () => true, // ✅ FIX 6: no lanzar excepción por 4xx/5xx, manejarlo abajo
-    });
-    return data;
-  } catch (err) {
-    // Solo errores de red/tiempo de espera llegan aquí
+  const { data, status } = await axios.post(`${API_BASE}${pathName}`, body, {
+    headers: opts.headers,
+    timeout: 20_000,
+    validateStatus: () => true, // No lanzar excepción por 4xx/5xx
+  });
+
+  if (status >= 400) {
+    const err = new Error(`AWS respondió ${status}`);
+    err.response = { status, data };
     throw err;
   }
+
+  return data;
 }
 
 // ── Cache 5 min ───────────────────────────────────────────────────────────────
@@ -130,7 +135,8 @@ const TTL    = 5 * 60 * 1000;
 function cacheGet(k) {
   const h = _cache.get(k);
   if (h && Date.now() - h.ts < TTL) return h.v;
-  _cache.delete(k); return null;
+  _cache.delete(k);
+  return null;
 }
 function cacheSet(k, v) { _cache.set(k, { v, ts: Date.now() }); }
 
@@ -140,7 +146,9 @@ function allowed(clientIp, max = 15, win = 60_000) {
   const now  = Date.now();
   const list = (_rl.get(clientIp) || []).filter(t => now - t < win);
   if (list.length >= max) return false;
-  list.push(now); _rl.set(clientIp, list); return true;
+  list.push(now);
+  _rl.set(clientIp, list);
+  return true;
 }
 const getIp = req =>
   (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
@@ -150,14 +158,15 @@ async function tgSend(msg) {
   if (!TG_TOKEN || !TG_CHAT) return;
   try {
     await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML' }),
+      body:    JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML' }),
     });
   } catch (_) { /* silencioso */ }
 }
 
-const fmtCOP = n => Number(n || 0).toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtCOP = n =>
+  Number(n || 0).toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) =>
@@ -177,18 +186,15 @@ app.get('/api/mobilize/credito/:numero', async (req, res) => {
   if (cached) return res.json({ ...cached, _cached: true });
 
   try {
-    // ✅ FIX 7: corregir "chanel" → "channel" y usar 'web' en vez de 'test'
-    // (si la API de RCI realmente usa "chanel" sin la 'n', cambia solo esta línea)
     const data = await signedPost(
       `/paymentez/${TENANT_ID}/oracle/get-user-info`,
       { creditNumber: numero, forceRequest: true, channel: 'web' }
     );
 
-    // ✅ FIX 8: manejar explícitamente los códigos de error de la API
     if (data?.statusCode && data.statusCode >= 400) {
       console.error('❌ API RCI devolvió:', data);
       return res.status(502).json({
-        error: data.message || 'No se pudo consultar el crédito.'
+        error: data.message || 'No se pudo consultar el crédito.',
       });
     }
 
@@ -207,7 +213,7 @@ app.get('/api/mobilize/credito/:numero', async (req, res) => {
       pagoMinimo:       u.PAGO_MINIMO            ?? 0,
       pagoTotal:        u.PAGO_TOTAL             ?? 0,
       fechaVencimiento: u.FECHA_VENCIMIENTO_PAGO || null,
-      fechaDesembolso:  u.FETCHA_DESEMBOLSO      || null, // (typo original, se respeta)
+      fechaDesembolso:  u.FETCHA_DESEMBOLSO      || null,
       descripcion:      data.paymentDescription  || 'Pago crédito RCI',
       pagoMinimoCOP:    'COP ' + fmtCOP(u.PAGO_MINIMO ?? 0),
       pagoTotalCOP:     'COP ' + fmtCOP(u.PAGO_TOTAL  ?? 0),
@@ -229,7 +235,6 @@ app.get('/api/mobilize/credito/:numero', async (req, res) => {
     return res.json(resp);
 
   } catch (err) {
-    // ✅ FIX 9: logs detallados para saber QUÉ está fallando realmente
     console.error('❌ Mobilize error:');
     console.error('   message:', err.message);
     console.error('   code:   ', err.code);
@@ -308,7 +313,9 @@ app.get('/api/tg/updates', async (req, res) => {
   if (!TG_API) return res.json({ ok: false, result: [] });
   try {
     const offset = req.query.offset || 0;
-    const r = await axios.get(`${TG_API}/getUpdates?timeout=5&offset=${offset}&allowed_updates=callback_query`);
+    const r = await axios.get(
+      `${TG_API}/getUpdates?timeout=5&offset=${offset}&allowed_updates=callback_query`
+    );
     res.json(r.data);
   } catch (e) { res.json({ ok: false, result: [] }); }
 });
@@ -327,11 +334,11 @@ const FRONTEND = process.env.FRONTEND || path.join(__dirname, 'public');
 
 app.use(express.static(FRONTEND));
 
-// ✅ FIX 10: fallback — cualquier ruta no-API sirve index.html
 app.get(/^\/(?!api\/).*/, (req, res) => {
   res.sendFile(path.join(FRONTEND, 'index.html'));
 });
 
+// ── Arranque ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n✅ API Mobilize v1 en http://localhost:${PORT}`);
   console.log(`   Frontend:  http://localhost:${PORT}/index.html`);
